@@ -1,5 +1,6 @@
 clear
 sudo apt update && sudo apt upgrade -y
+sudo apt install ufw
 sudo ufw allow 80/tcp
 sudo ufw allow 8080/tcp
 sudo ufw allow 22/tcp
