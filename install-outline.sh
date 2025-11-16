@@ -1,4 +1,5 @@
 clear
+apt install sudo
 sudo apt update && sudo apt upgrade -y
 echo "Y" | sudo apt install ufw
 sudo ufw allow 80/tcp
