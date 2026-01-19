@@ -19,8 +19,12 @@ echo "y" | sudo ufw enable
 # iptables
 # Block Torrents trafic
 echo "Y" | sudo apt install iptables
-iptables -A FORWARD -p tcp --dport 6881:6999 -j DROP
-iptables -A FORWARD -p udp --dport 6881:6999 -j DROP
+# DHT
+iptables -A OUTPUT -p udp --dport 6881:6889 -j DROP
+iptables -A OUTPUT -p udp --dport 51413 -j DROP
+
+# PEX / LSD
+iptables -A OUTPUT -p udp -m string --algo bm --string "BitTorrent protocol" -j DROP
 
 # Installing Outline
 echo "Y" | sudo wget -qO- https://raw.githubusercontent.com/Jigsaw-Code/outline-server/master/src/server_manager/install_scripts/install_server.sh | bash
