@@ -26,5 +26,11 @@ iptables -A OUTPUT -p udp --dport 51413 -j DROP
 # PEX / LSD
 iptables -A OUTPUT -p udp -m string --algo bm --string "BitTorrent protocol" -j DROP
 
+# Block Any scanners to the server
+sudo traffic-guard full \
+  -u https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list \
+  -u https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list \
+  --enable-logging
+
 # Installing Outline
 echo "Y" | sudo wget -qO- https://raw.githubusercontent.com/Jigsaw-Code/outline-server/master/src/server_manager/install_scripts/install_server.sh | bash
