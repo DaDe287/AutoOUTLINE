@@ -222,18 +222,25 @@ main() {
     apt-get install -y nginx certbot ca-certificates curl openssl python3 ufw iproute2
     [[ -z $(ss -H -ltn 'sport = :18080') ]] || die 'Локальный порт 18080 занят.'
 
-    # Preserve existing UFW rules. Permit SSH before enabling the firewall.
-    ufw allow "${SSH_PORT}/tcp"
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    if ! ufw status | LC_ALL=C grep -q '^Status: active'; then
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw --force enable
-    fi
-
     TMP_DIR=$(mktemp -d)
     trap 'rm -rf -- "${TMP_DIR}"' EXIT
+    # Download completely before executing; stop on download or syntax errors.
+    curl --fail --location --retry 3 --connect-timeout 20 --max-time 120 \
+        'https://raw.githubusercontent.com/DaDe287/Traffic-Guard/refs/heads/main/install.sh' \
+        -o "$TMP_DIR/traffic-guard-install.sh"
+    bash -n "$TMP_DIR/traffic-guard-install.sh"
+
+    # User-requested clean firewall policy. This deliberately removes old UFW rules.
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
+    local port
+    for port in "$SSH_PORT" 80 443 6044; do
+        ufw allow "${port}/tcp"
+    done
+    ufw allow 443/udp
+    ufw --force enable
+
     local asset="outline-ss-server_${OUTLINE_VERSION}_linux_${ARCH}.tar.gz"
     local base="https://github.com/OutlineFoundation/tunnel-server/releases/download/v${OUTLINE_VERSION}"
     printf '\nЗагрузка официального outline-ss-server %s…\n' "$OUTLINE_VERSION"
@@ -335,6 +342,10 @@ systemctl reload nginx
 EOF
     chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/outline-wss-nginx.sh
     systemctl enable --now certbot.timer
+
+    printf '\nУстановка и активация Traffic Guard…\n'
+    bash "$TMP_DIR/traffic-guard-install.sh"
+    /usr/local/bin/traffic-guard --version
 
     # Verify certificate, YAML download and both real WebSocket handshakes locally.
     curl --fail --silent --show-error --noproxy '*' --max-time 15 \
