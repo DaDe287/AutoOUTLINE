@@ -10,5 +10,5 @@ bash <(curl -Ls https://raw.githubusercontent.com/DaDe287/AutoOUTLINE/main/insta
 v2:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/DaDe287/AutoOUTLINE/main/install-outline-v2.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/DaDe287/AutoOUTLINE/main/install-outline-v2.sh) --add-api
 ```
