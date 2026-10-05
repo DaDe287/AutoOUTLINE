@@ -106,8 +106,8 @@ server {
     add_header X-Content-Type-Options nosniff always;
 
     # Bearer URL: anyone who knows this path can download the access key.
-    location = ${KEY_PATH} {
-        alias ${CONF_DIR}/client.yaml;
+    location ~ "^/config/([a-f0-9]{64})\\.yaml\$" {
+        alias ${CONF_DIR}/clients/\$1.yaml;
         default_type text/plain;
         add_header Cache-Control "no-store" always;
         add_header X-Content-Type-Options nosniff always;
@@ -143,30 +143,577 @@ EOF
     location / { try_files $uri $uri/ =404; }
 }
 EOF
+    cat <<EOF
+server {
+    listen 6044 ssl;
+    listen [::]:6044 ssl;
+    server_name ${DOMAIN};
+    ssl_certificate ${CONF_DIR}/api-cert.pem;
+    ssl_certificate_key ${CONF_DIR}/api-key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+    access_log off;
+    client_max_body_size 64k;
+    location ^~ /${API_TOKEN}/ {
+        proxy_pass http://127.0.0.1:18100/;
+        proxy_http_version 1.1;
+        proxy_set_header X-Outline-Api-Token "${API_TOKEN}";
+        proxy_set_header Host \$host;
+        proxy_set_header Connection "";
+        proxy_read_timeout 60s;
+    }
+    location / { return 404; }
 }
-
-render_site() {
-    cat <<'EOF'
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Field Notes — Places, ideas, everyday details</title>
-<style>
-:root{color-scheme:light;--ink:#26362e;--paper:#f6f3eb;--line:#dcded2}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:17px/1.7 system-ui,sans-serif}main{max-width:1050px;margin:auto;padding:30px 24px 60px}nav{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:12px 0 22px}nav a{color:inherit;text-decoration:none}small,.label{font-size:12px;letter-spacing:.15em;text-transform:uppercase}header{padding:75px 0 55px;max-width:780px}h1{font:clamp(42px,7vw,76px)/1.08 Georgia,serif;letter-spacing:-.035em;margin:18px 0 25px}header p{max-width:560px;color:#627166}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}article{border-top:1px solid var(--line);padding-top:22px}h2{font:28px/1.25 Georgia,serif}article p{color:#627166}.art{height:150px;border-radius:3px;background:linear-gradient(145deg,#b5c0aa,#dde0c8)}article:nth-child(2) .art{background:linear-gradient(140deg,#dbb897,#eee0c7)}article:nth-child(3) .art{background:linear-gradient(140deg,#91aaa9,#cdd9d1)}section.about{border-top:1px solid var(--line);margin-top:65px;padding-top:28px;max-width:650px}footer{margin-top:55px;font-size:13px;color:#627166}@media(max-width:650px){.grid{grid-template-columns:1fr}header{padding-top:45px}.art{height:180px}}
-</style></head><body><main>
-<nav><strong>FIELD NOTES</strong><a href="#about">About this journal ↗</a></nav>
-<header><span class="label">An independent journal</span><h1>A little room<br>for curiosity.</h1><p>Observations on places, thoughtful design, and the details that make everyday life feel a little richer.</p></header>
-<div class="grid"><article><div class="art"></div><h2>Taking the slower route</h2><p>A walk without a destination leaves space to notice familiar streets in a different light.</p></article><article><div class="art"></div><h2>Things made to last</h2><p>Simple materials, careful decisions, and objects that become more interesting with time.</p></article><article><div class="art"></div><h2>A quiet beginning</h2><p>A notebook, an open window, and a few minutes before the day gets busy.</p></article></div>
-<section class="about" id="about"><small>About</small><h2>Small observations. Open possibilities.</h2><p>Field Notes is a small personal corner of the web for collecting ideas and noticing what is close at hand. Thanks for stopping by.</p></section><footer>Field Notes · A personal journal</footer>
-</main></body></html>
 EOF
 }
 
+install_random_site() {
+    local choice archive stage
+    choice=$(python3 -c 'import secrets; print(secrets.randbelow(3))')
+    case "$choice" in
+        0)
+            SITE_TEMPLATE=clean-blog
+            SITE_COMMIT=1ebc4f8f3b6194335df237a2a7837955a5a4a9aa
+            SITE_SHA256=ee5b86b01a5eb5d7704d4da621aaae6c657b74821c11fc275e405058ba0fb67d
+            ;;
+        1)
+            SITE_TEMPLATE=business-casual
+            SITE_COMMIT=b6f928934386a54e08c2e7f40ebd9e4d7510bba4
+            SITE_SHA256=aa5345459728854c05fe42a6b1bee3d4b8e2fb482707b8145d2529798f1d1db1
+            ;;
+        2)
+            SITE_TEMPLATE=modern-business
+            SITE_COMMIT=7d297106cbda2f04db4696752fcdb5b4dc9cd936
+            SITE_SHA256=d708c0376a3c101aa8980c2caa0966dd8919878de59214d15e42c8a9be8a9257
+            ;;
+        *) die 'Не удалось выбрать шаблон сайта.' ;;
+    esac
+    printf '\nШаблон сайта: Start Bootstrap %s\n' "$SITE_TEMPLATE"
+    archive="$TMP_DIR/startbootstrap.tar.gz"
+    stage="$TMP_DIR/startbootstrap-site"
+    curl --fail --location --retry 3 --connect-timeout 20 --max-time 180 \
+        "https://codeload.github.com/StartBootstrap/startbootstrap-${SITE_TEMPLATE}/tar.gz/${SITE_COMMIT}" \
+        -o "$archive"
+    python3 - "$archive" "$stage" "$SITE_SHA256" "$DOMAIN" <<'STARTBOOTSTRAP_PY'
+import hashlib
+import pathlib
+import re
+import sys
+import tarfile
+
+archive, destination, expected, domain = sys.argv[1:]
+archive = pathlib.Path(archive)
+destination = pathlib.Path(destination)
+if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+    raise SystemExit('Start Bootstrap: SHA256 архива не совпадает')
+if not re.fullmatch(r'[a-z0-9.-]+', domain):
+    raise SystemExit('Некорректный домен')
+destination.mkdir(mode=0o755, parents=True, exist_ok=True)
+with tarfile.open(archive, 'r:gz') as source:
+    members = source.getmembers()
+    roots = {pathlib.PurePosixPath(m.name).parts[0] for m in members if m.name}
+    if len(roots) != 1:
+        raise SystemExit('Некорректная структура архива шаблона')
+    root = next(iter(roots))
+    total = 0
+    for member in members:
+        parts = pathlib.PurePosixPath(member.name).parts
+        if len(parts) < 3 or parts[:2] != (root, 'dist'):
+            continue
+        relative = pathlib.PurePosixPath(*parts[2:])
+        if '..' in relative.parts or relative.is_absolute() or member.issym() or member.islnk():
+            raise SystemExit('Небезопасный путь в архиве шаблона')
+        target = destination.joinpath(*relative.parts)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True, mode=0o755)
+            continue
+        if not member.isfile():
+            raise SystemExit('Неподдерживаемый тип файла в шаблоне')
+        total += member.size
+        if total > 100_000_000:
+            raise SystemExit('Шаблон слишком большой')
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        with source.extractfile(member) as inp, target.open('wb') as out:
+            out.write(inp.read())
+        target.chmod(0o644)
+    licenses = [m for m in members if m.name == root + '/LICENSE' and m.isfile()]
+    if len(licenses) != 1:
+        raise SystemExit('Не найдена лицензия шаблона')
+    (destination/'LICENSE.txt').write_bytes(source.extractfile(licenses[0]).read())
+pages = list(destination.glob('*.html'))
+if len(pages) < 3 or not (destination/'index.html').is_file() or not (destination/'css/styles.css').is_file():
+    raise SystemExit('В шаблоне нет готового многостраничного сайта')
+for page in pages:
+    text = page.read_text()
+    # These are static cover pages, not a configured third-party form service.
+    text = re.sub(r'<script\b[^>]*\bsrc=["\']https://cdn\.startbootstrap\.com/sb-forms-latest\.js["\'][^>]*>\s*</script>', '', text, flags=re.I)
+    text = re.sub(r'<form\b[^>]*>[\s\S]*?</form>',
+        f'<div class="py-4"><p>Contact us by email:</p><a href="mailto:webmaster@{domain}">webmaster@{domain}</a></div>',
+        text, flags=re.I)
+    page.write_text(text)
+print('Start Bootstrap: SHA256, лицензия и готовые страницы проверены; страниц:', len(pages))
+STARTBOOTSTRAP_PY
+    cp -a "$stage/." "$WEB_ROOT/"
+    find "$WEB_ROOT" -type d -exec chmod 0755 {} +
+    find "$WEB_ROOT" -type f -exec chmod 0644 {} +
+}
+
+render_api() {
+    cat <<'OUTLINE_WSS_API_PY'
+#!/usr/bin/env python3
+"""Outline Manager adapter for an official Outline WSS backend.
+Key CRUD and live usage counters; quotas and telemetry are unsupported.
+"""
+import copy
+import grp
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import build_opener, ProxyHandler
+
+CIPHER = 'chacha20-ietf-poly1305'
+
+class APIError(Exception):
+    def __init__(self, status, message):
+        self.status, self.message = status, message
+
+def atomic_write(path, text, mode=0o600, group=None):
+    path = Path(path)
+    tmp = path.with_name(path.name + '.' + secrets.token_hex(8) + '.tmp')
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if group:
+            os.chown(tmp, 0, grp.getgrnam(group).gr_gid)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def backend_config(s):
+    return json.dumps({'web': {'servers': [{'id': 'web', 'listen': ['127.0.0.1:18080']}]},
+        'services': [{'listeners': [
+            {'type': 'websocket-stream', 'web_server': 'web', 'path': s['tcpPath']},
+            {'type': 'websocket-packet', 'web_server': 'web', 'path': s['udpPath']}],
+            'keys': [{'id': k['id'], 'cipher': CIPHER, 'secret': k['password']} for k in s['keys']]}]}, indent=2) + '\n'
+
+def client_config(s, k):
+    lines = ['transport:', '  $type: tcpudp']
+    for kind, path in [('tcp', s['tcpPath']), ('udp', s['udpPath'])]:
+        lines.extend([f'  {kind}:', '    $type: shadowsocks', '    endpoint:',
+            '      $type: websocket',
+            '      url: ' + json.dumps(f"wss://{s['domain']}:443{path}"),
+            '    cipher: ' + CIPHER, '    secret: ' + json.dumps(k['password'])])
+    return '\n'.join(lines) + '\n'
+
+def key_model(s, k):
+    return {'id': k['id'], 'name': k['name'], 'password': k['password'], 'method': CIPHER,
+        'port': 443, 'accessUrl': f"ssconf://{s['domain']}/config/{k['token']}.yaml"}
+
+class Store:
+    def __init__(self, root, runner=None, groups=True):
+        self.root = Path(root)
+        self.lock = threading.RLock()
+        self.runner = runner or self.restart
+        self.groups = groups
+        self.state = json.loads((self.root / 'state.json').read_text())
+    @staticmethod
+    def restart():
+        subprocess.run(['systemctl', 'restart', 'outline-wss'], check=True, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        subprocess.run(['systemctl', 'is-active', '--quiet', 'outline-wss'], check=True, timeout=5)
+    def publish(self, s):
+        clients = self.root / 'clients'
+        clients.mkdir(mode=0o751, exist_ok=True)
+        for k in s['keys']:
+            atomic_write(clients / (k['token'] + '.yaml'), client_config(s, k),
+                         0o640, 'www-data' if self.groups else None)
+        atomic_write(self.root / 'config.yaml', backend_config(s),
+                     0o640, 'outline-wss' if self.groups else None)
+    def prune(self):
+        keep = {k['token'] + '.yaml' for k in self.state['keys']}
+        for file in (self.root / 'clients').glob('*.yaml'):
+            if file.name not in keep:
+                file.unlink()
+        if self.state['keys']:
+            k = self.state['keys'][0]
+            atomic_write(self.root / 'access-key.txt', key_model(self.state, k)['accessUrl'] + '\n')
+            atomic_write(self.root / 'client.yaml', client_config(self.state, k),
+                         0o640, 'www-data' if self.groups else None)
+        else:
+            (self.root / 'access-key.txt').unlink(missing_ok=True)
+            (self.root / 'client.yaml').unlink(missing_ok=True)
+    def reconcile(self):
+        changed = (self.root / 'config.yaml').read_text() != backend_config(self.state)
+        self.publish(self.state)
+        if changed:
+            self.runner()
+        self.prune()
+    def commit(self, new, changed=False):
+        old = copy.deepcopy(self.state)
+        try:
+            if changed:
+                self.publish(new)
+                self.runner()
+            atomic_write(self.root / 'state.json', json.dumps(new, indent=2) + '\n')
+        except Exception:
+            self.publish(old)
+            if changed:
+                self.runner()
+            self.prune()
+            raise
+        self.state = new
+        self.prune()
+    def usage(self):
+        try:
+            with build_opener(ProxyHandler({})).open('http://127.0.0.1:18090/metrics', timeout=5) as r:
+                text = r.read(4000001)
+            if len(text) > 4000000:
+                raise ValueError('metrics too large')
+        except Exception as e:
+            raise APIError(503, 'Outline metrics unavailable') from e
+        totals = {k['id']: 0 for k in self.state['keys']}
+        for line in text.decode().splitlines():
+            m = re.fullmatch(r'shadowsocks_data_bytes\{(.*?)\}\s+([0-9.eE+\-]+)(?:\s+\d+)?', line)
+            if m:
+                labels = dict(re.findall(r'(\w+)="([^"\\]*)"', m[1]))
+                if labels.get('dir') in ('c>p', 'p<c') and labels.get('access_key') in totals:
+                    totals[labels['access_key']] += int(float(m[2]))
+        return {'bytesTransferredByUserId': totals}
+    def dispatch(self, method, path, body):
+        with self.lock:
+            s = self.state
+            if method == 'GET' and path == '/server':
+                return 200, {'name': s['name'], 'serverId': s['serverId'], 'version': '1.9.2',
+                    'createdTimestampMs': s['createdTimestampMs'], 'metricsEnabled': False,
+                    'portForNewAccessKeys': 443, 'hostnameForAccessKeys': s['domain']}
+            if method == 'GET' and path == '/metrics/transfer':
+                return 200, self.usage()
+            if method == 'GET' and path == '/access-keys':
+                return 200, {'accessKeys': [key_model(s, k) for k in s['keys']]}
+            if 'data-limit' in path:
+                if method == 'DELETE':
+                    return 204, None
+                raise APIError(501, 'Data limits are not supported by this WSS adapter')
+            if method == 'PUT' and path == '/metrics/enabled':
+                if body.get('metricsEnabled') is not False:
+                    raise APIError(501, 'Telemetry submission is not supported')
+                return 204, None
+            if method == 'PUT' and path == '/server/port-for-new-access-keys':
+                if body.get('port') != 443:
+                    raise APIError(400, 'WSS port is fixed to 443')
+                return 204, None
+            if method == 'PUT' and path == '/server/hostname-for-access-keys':
+                if body.get('hostname') != s['domain']:
+                    raise APIError(400, 'Changing hostname requires nginx and certificate changes')
+                return 204, None
+            if method == 'PUT' and path == '/name':
+                name = body.get('name')
+                if not isinstance(name, str) or len(name) > 200:
+                    raise APIError(400, 'Invalid server name')
+                new = copy.deepcopy(s)
+                new['name'] = name
+                self.commit(new)
+                return 204, None
+            m = re.fullmatch(r'/access-keys/([A-Za-z0-9_-]{1,64})(/name)?', path)
+            kid = m[1] if m else None
+            key = next((k for k in s['keys'] if k['id'] == kid), None)
+            if (method == 'POST' and path == '/access-keys') or (method == 'PUT' and m and not m[2]):
+                if len(s['keys']) >= 1000 or key:
+                    raise APIError(409, 'Key already exists or maximum number of keys reached')
+                if body.get('port', 443) != 443 or body.get('method', CIPHER) != CIPHER:
+                    raise APIError(400, 'Only port 443 and chacha20-ietf-poly1305 are supported')
+                if 'limit' in body:
+                    raise APIError(501, 'Data limits are not supported')
+                name, password = body.get('name', ''), body.get('password', secrets.token_urlsafe(32))
+                if not isinstance(name, str) or len(name) > 200:
+                    raise APIError(400, 'Invalid key name')
+                if not isinstance(password, str) or not 16 <= len(password) <= 256:
+                    raise APIError(400, 'Password must contain 16 to 256 characters')
+                new = copy.deepcopy(s)
+                if kid is None:
+                    kid = str(new['nextId'])
+                    new['nextId'] += 1
+                    while any(k['id'] == kid for k in new['keys']):
+                        kid = str(new['nextId'])
+                        new['nextId'] += 1
+                created = {'id': kid, 'name': name, 'password': password, 'token': secrets.token_hex(32)}
+                new['keys'].append(created)
+                self.commit(new, changed=True)
+                return 201, key_model(new, created)
+            if m:
+                if key is None:
+                    raise APIError(404, 'Key not found')
+                if method == 'GET' and not m[2]:
+                    return 200, key_model(s, key)
+                if method == 'PUT' and m[2]:
+                    name = body.get('name')
+                    if not isinstance(name, str) or len(name) > 200:
+                        raise APIError(400, 'Invalid key name')
+                    new = copy.deepcopy(s)
+                    next(k for k in new['keys'] if k['id'] == kid)['name'] = name
+                    self.commit(new)
+                    return 204, None
+                if method == 'DELETE' and not m[2]:
+                    new = copy.deepcopy(s)
+                    new['keys'] = [k for k in new['keys'] if k['id'] != kid]
+                    self.commit(new, changed=True)
+                    return 204, None
+            raise APIError(404, 'Endpoint not found')
+
+class Handler(BaseHTTPRequestHandler):
+    store = None
+    server_version, sys_version = 'OutlineWSSAPI', ''
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+    def log_message(self, *_args):
+        pass
+    def reply(self, status, payload=None):
+        data = json.dumps(payload).encode() if payload is not None else b''
+        self.send_response(status)
+        for k, v in [('Content-Type','application/json'), ('Cache-Control','no-store'),
+                     ('Access-Control-Allow-Origin','*'),
+                     ('Access-Control-Allow-Methods','GET, POST, PUT, DELETE, OPTIONS'),
+                     ('Access-Control-Allow-Headers','Content-Type'), ('Content-Length',str(len(data)))]:
+            self.send_header(k, v)
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
+    def handle_request(self):
+        try:
+            if not hmac.compare_digest(self.headers.get('X-Outline-Api-Token', ''), self.store.state['apiToken']):
+                raise APIError(404, 'Not found')
+            if self.command == 'OPTIONS':
+                self.reply(204)
+                return
+            if self.headers.get('Transfer-Encoding'):
+                raise APIError(400, 'Transfer-Encoding is not supported')
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+            except ValueError:
+                raise APIError(400, 'Invalid Content-Length')
+            if not 0 <= length <= 65536:
+                raise APIError(413, 'Request body too large')
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise APIError(400, 'Incomplete request body')
+            body = {}
+            if raw:
+                try:
+                    if self.headers.get('Content-Type', '').split(';', 1)[0] == 'application/x-www-form-urlencoded':
+                        body = {k: v[-1] for k, v in parse_qs(raw.decode(), keep_blank_values=True).items()}
+                    else:
+                        body = json.loads(raw)
+                    if not isinstance(body, dict):
+                        raise ValueError('Expected object')
+                except (ValueError, UnicodeError):
+                    raise APIError(400, 'Invalid body')
+            status, data = self.store.dispatch(self.command, urlsplit(self.path).path, body)
+            self.reply(status, data)
+        except APIError as e:
+            self.reply(e.status, {'code':'Error', 'message':e.message})
+        except Exception as e:
+            print('API operation failed:', type(e).__name__, file=sys.stderr, flush=True)
+            self.reply(500, {'code':'InternalError', 'message':'Operation failed; inspect API service log'})
+    do_GET = do_POST = do_PUT = do_DELETE = do_OPTIONS = handle_request
+
+def main():
+    Handler.store = Store(sys.argv[1] if len(sys.argv) > 1 else '/etc/outline-wss')
+    Handler.store.reconcile()
+    server = ThreadingHTTPServer(('127.0.0.1', 18100), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
+
+if __name__ == '__main__':
+    main()
+OUTLINE_WSS_API_PY
+}
+
+install_api() {
+    install -d -m 0755 /usr/local/lib/outline-wss
+    render_api > /usr/local/lib/outline-wss/api.py
+    chmod 0644 /usr/local/lib/outline-wss/api.py
+    INITIAL_KEY_PATH="${KEY_PATH:-}" python3 - "$CONF_DIR" <<'PY'
+import json, os, pathlib, re, secrets, time, uuid
+from urllib.parse import urlsplit
+import yaml
+root = pathlib.Path(__import__('sys').argv[1])
+if not (root / 'state.json').exists():
+    backend = yaml.safe_load((root / 'config.yaml').read_text())
+    client = yaml.safe_load((root / 'client.yaml').read_text())
+    domain = urlsplit(client['transport']['tcp']['endpoint']['url']).hostname
+    if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
+        raise SystemExit('Invalid domain in existing client configuration')
+    listeners = backend['services'][0]['listeners']
+    key_path = os.environ.get('INITIAL_KEY_PATH', '')
+    if not key_path and (root / 'access-key.txt').exists():
+        key_path = urlsplit((root / 'access-key.txt').read_text().strip()).path
+    token = pathlib.PurePosixPath(key_path).stem
+    if not re.fullmatch(r'[a-f0-9]{64}', token):
+        token = secrets.token_hex(32)
+    old_keys = backend['services'][0]['keys']
+    if len(old_keys) != 1:
+        raise SystemExit('Migration expects the original single-key WSS installation')
+    state = {'domain': domain, 'name': 'Outline WSS', 'serverId': str(uuid.uuid4()),
+        'createdTimestampMs': int(time.time()*1000), 'apiToken': secrets.token_hex(32),
+        'tcpPath': next(x['path'] for x in listeners if x['type']=='websocket-stream'),
+        'udpPath': next(x['path'] for x in listeners if x['type']=='websocket-packet'),
+        'nextId': 1, 'keys': [{'id': str(old_keys[0]['id']), 'name': 'First key',
+                              'password': old_keys[0]['secret'], 'token': token}]}
+    (root / 'state.json').write_text(json.dumps(state, indent=2)+'\n')
+    (root / 'state.json').chmod(0o600)
+PY
+    local -a values
+    mapfile -t values < <(python3 - "$CONF_DIR/state.json" <<'PY'
+import json, sys
+s=json.load(open(sys.argv[1]))
+for k in ('domain','tcpPath','udpPath','apiToken'): print(s[k])
+PY
+    )
+    [[ ${#values[@]} -eq 4 ]] || die 'Не удалось прочитать параметры API.'
+    DOMAIN=${values[0]}
+    TCP_PATH=${values[1]}
+    UDP_PATH=${values[2]}
+    API_TOKEN=${values[3]}
+    valid_domain "$DOMAIN" || die 'Некорректный домен в state.json.'
+    [[ $TCP_PATH =~ ^/v2/api/[a-f0-9]+/stream$ && $UDP_PATH =~ ^/v2/api/[a-f0-9]+/packet$ &&
+       $API_TOKEN =~ ^[a-f0-9]{64}$ ]] || die 'Некорректные пути в state.json.'
+    if [[ ! -s ${CONF_DIR}/api-cert.pem ]]; then
+        openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+            -subj "/CN=Outline WSS Management" \
+            -keyout "$CONF_DIR/api-key.pem" -out "$CONF_DIR/api-cert.pem"
+        chmod 0600 "$CONF_DIR/api-key.pem"
+        chmod 0644 "$CONF_DIR/api-cert.pem"
+    fi
+    # Outline Manager pins this separate certificate; website renewals do not change it.
+    local api_host
+    api_host=$(curl -4 --fail --silent --show-error --connect-timeout 10 --max-time 20 https://api.ipify.org || true)
+    if ! python3 - "$api_host" <<'PY'
+import ipaddress, sys
+try:
+    a=ipaddress.ip_address(sys.argv[1])
+    assert a.version == 4 and a.is_global
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+        api_host=$DOMAIN
+        printf 'Не удалось определить публичный IPv4: API использует домен. Cloudflare Proxy для API должен быть выключен.\n'
+    fi
+    API_HOST="$api_host" python3 - "$CONF_DIR" <<'PY'
+import json, os, pathlib, ssl, hashlib, sys
+root=pathlib.Path(sys.argv[1]); s=json.loads((root/'state.json').read_text())
+der=ssl.PEM_cert_to_DER_cert((root/'api-cert.pem').read_text())
+m={'apiUrl':f"https://{os.environ['API_HOST']}:6044/{s['apiToken']}",
+   'certSha256':hashlib.sha256(der).hexdigest().upper()}
+(root/'manager.json').write_text(json.dumps(m,indent=2)+'\n')
+(root/'manager.json').chmod(0o600)
+PY
+    # Expose metrics only on loopback for the management adapter.
+    sed -i 's|^ExecStart=.*|ExecStart=/usr/local/bin/outline-ss-server -config=/etc/outline-wss/config.yaml -metrics=127.0.0.1:18090|' \
+        /etc/systemd/system/outline-wss.service
+    cat > /etc/systemd/system/outline-wss-api.service <<'EOF'
+[Unit]
+Description=Outline WSS management API adapter
+After=outline-wss.service
+Wants=outline-wss.service
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/outline-wss/api.py /etc/outline-wss
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/outline-wss
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 /etc/systemd/system/outline-wss-api.service
+    systemctl daemon-reload
+    systemctl restart outline-wss
+    systemctl enable --now outline-wss-api
+    # Ensure a re-run loads the newly embedded API too.
+    systemctl restart outline-wss-api
+    cp -a "$NGINX_CONF" "$CONF_DIR/nginx-before-api.conf"
+    render_nginx > "$NGINX_CONF"
+    chmod 0600 "$NGINX_CONF"
+    nginx -t
+    systemctl reload nginx
+    local attempt api_ready=0
+    for attempt in {1..20}; do
+        # The API certificate is pinned rather than hostname-validated by Manager.
+        if API_TEST_TOKEN="$API_TOKEN" python3 - "$CONF_DIR" 2>/dev/null <<'PY'
+import os, ssl, sys, urllib.request
+ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname=False
+ctx.load_verify_locations(sys.argv[1]+'/api-cert.pem')
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+with opener.open('https://127.0.0.1:6044/'+os.environ['API_TEST_TOKEN']+'/server',timeout=3) as r:
+    assert r.status == 200
+PY
+        then api_ready=1; break; fi
+        sleep 1
+    done
+    ((api_ready == 1)) || die 'API не ответил: journalctl -u outline-wss-api -n 100.'
+    API_TEST_TOKEN="$API_TOKEN" python3 - "$CONF_DIR" <<'PY'
+import json, os, pathlib, ssl, sys, urllib.error, urllib.request
+root=pathlib.Path(sys.argv[1])
+ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname=False
+ctx.load_verify_locations(str(root/'api-cert.pem'))
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+base='https://127.0.0.1:6044/'+os.environ['API_TEST_TOKEN']
+def request(method,path,body=None):
+    req=urllib.request.Request(base+path,method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={'Content-Type':'application/json'})
+    with opener.open(req,timeout=45) as r:
+        raw=r.read()
+        return json.loads(raw) if raw else None
+key=request('POST','/access-keys',{'name':'Installation check'})
+try:
+    assert key['port']==443 and key['accessUrl'].startswith('ssconf://')
+    token=key['accessUrl'].rsplit('/',1)[-1]
+    assert (root/'clients'/token).is_file()
+    assert key['password'] in (root/'config.yaml').read_text()
+    request('PUT','/access-keys/'+key['id']+'/name',{'name':'Installation check renamed'})
+    assert request('GET','/access-keys/'+key['id'])['name']=='Installation check renamed'
+finally:
+    request('DELETE','/access-keys/'+key['id'])
+assert not (root/'clients'/token).exists()
+assert key['password'] not in (root/'config.yaml').read_text()
+request('GET','/metrics/transfer')
+print('API: создание, переименование, удаление WSS-ключа и метрики проверены.')
+PY
+}
+
 show_result() {
-    printf '\nГотово. Ключ для Outline Client:\n'
-    cat "${CONF_DIR}/access-key.txt"
+    printf '\nДанные для добавления сервера в Outline Manager:\n'
+    cat "${CONF_DIR}/manager.json"
+    if [[ -s ${CONF_DIR}/access-key.txt ]]; then
+        printf '\nПервый ключ для Outline Client:\n'
+        cat "${CONF_DIR}/access-key.txt"
+    fi
     printf '\nКонфигурация: %s/config.yaml\n' "$CONF_DIR"
     printf 'Сайт: %s/index.html\n' "$WEB_ROOT"
     printf 'Журнал: journalctl -u outline-wss -n 100 --no-pager\n'
+    printf 'Журнал API: journalctl -u outline-wss-api -n 100 --no-pager\n'
     printf 'Продление сертификата: certbot renew --dry-run\n'
 }
 
@@ -177,7 +724,18 @@ main() {
     source /etc/os-release
     [[ $ID == ubuntu || $ID == debian ]] || die 'Поддерживаются Ubuntu и Debian.'
     [[ -d /run/systemd/system ]] || die 'Нужен сервер с systemd.'
-    if [[ -s ${CONF_DIR}/access-key.txt ]]; then
+    if [[ ${1:-} == --add-api ]]; then
+        [[ -s ${CONF_DIR}/config.yaml ]] &&
+            [[ -s ${CONF_DIR}/client.yaml || -s ${CONF_DIR}/state.json ]] || die 'Не найдена предыдущая WSS-установка.'
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-yaml
+        ufw allow 6044/tcp
+        install_api
+        show_result
+        return
+    fi
+    [[ $# -eq 0 ]] || die 'Поддерживается только необязательный параметр --add-api.'
+    if [[ -s ${CONF_DIR}/manager.json ]]; then
         printf 'Установка уже выполнялась; существующие ключи не изменены.\n'
         show_result
         return
@@ -219,7 +777,7 @@ main() {
 
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y nginx certbot ca-certificates curl openssl python3 ufw iproute2
+    apt-get install -y nginx certbot ca-certificates curl openssl python3 python3-yaml ufw iproute2
     [[ -z $(ss -H -ltn 'sport = :18080') ]] || die 'Локальный порт 18080 занят.'
 
     TMP_DIR=$(mktemp -d)
@@ -269,8 +827,7 @@ PY
     install -m 0755 "$TMP_DIR/outline-ss-server" /usr/local/bin/outline-ss-server
 
     install -d -m 0755 "$WEB_ROOT/.well-known/acme-challenge"
-    render_site > "$WEB_ROOT/index.html"
-    chmod 0644 "$WEB_ROOT/index.html"
+    install_random_site
     render_http > "$NGINX_CONF"
     # Only the package's default enabled symlink is removed; its source is preserved.
     if [[ -L /etc/nginx/sites-enabled/default ]]; then
@@ -289,6 +846,8 @@ PY
     id outline-wss >/dev/null 2>&1 || useradd --system --user-group \
         --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin outline-wss
     install -d -m 0750 -o root -g outline-wss "$CONF_DIR"
+    printf '{"template":"%s","commit":"%s","sha256":"%s"}\n' \
+        "$SITE_TEMPLATE" "$SITE_COMMIT" "$SITE_SHA256" > "$CONF_DIR/site-template.json"
     TCP_PATH="/v2/api/$(openssl rand -hex 24)/stream"
     UDP_PATH="/v2/api/$(openssl rand -hex 24)/packet"
     KEY_PATH="/config/$(openssl rand -hex 32).yaml"
@@ -324,12 +883,8 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
     chmod 0644 /etc/systemd/system/outline-wss.service
-    render_nginx > "$NGINX_CONF"
-    chmod 0644 "$NGINX_CONF"
-    nginx -t
     systemctl daemon-reload
     systemctl enable --now outline-wss
-    systemctl reload nginx
     sleep 2
     systemctl is-active --quiet outline-wss || die 'Outline не запустился: journalctl -u outline-wss -n 100.'
 
@@ -342,6 +897,8 @@ systemctl reload nginx
 EOF
     chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/outline-wss-nginx.sh
     systemctl enable --now certbot.timer
+
+    install_api
 
     printf '\nУстановка и активация Traffic Guard…\n'
     bash "$TMP_DIR/traffic-guard-install.sh"
@@ -384,8 +941,6 @@ for path in sys.argv[2:]:
                 raise SystemExit('WebSocket: неверный Sec-WebSocket-Accept')
 print('HTTPS, загрузка ключа и оба WebSocket-входа проверены.')
 PY
-    printf 'ssconf://%s%s\n' "$DOMAIN" "$KEY_PATH" > "$CONF_DIR/access-key.txt"
-    chmod 0600 "$CONF_DIR/access-key.txt"
     show_result
 }
 
