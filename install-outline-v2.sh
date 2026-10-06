@@ -181,8 +181,6 @@ EOF
 EOF
     cat <<EOF
 server {
-    listen 6044 ssl;
-    listen [::]:6044 ssl;
     listen ${API_PORT} ssl;
     listen [::]:${API_PORT} ssl;
     server_name ${DOMAIN};
@@ -716,7 +714,6 @@ PY
 import json, os, pathlib, ssl, hashlib, sys
 root=pathlib.Path(sys.argv[1]); s=json.loads((root/'state.json').read_text())
 der=ssl.PEM_cert_to_DER_cert((root/'api-cert.pem').read_text())
-m={'apiUrl':f"https://{os.environ['API_HOST']}:6044/{s['apiToken']}",
 m={'apiUrl':f"https://{os.environ['API_HOST']}:{os.environ['API_PORT']}/{s['apiToken']}",
    'certSha256':hashlib.sha256(der).hexdigest().upper()}
 (root/'manager.json').write_text(json.dumps(m,indent=2)+'\n')
@@ -765,7 +762,6 @@ ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname=False
 ctx.load_verify_locations(sys.argv[1]+'/api-cert.pem')
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
-with opener.open('https://127.0.0.1:6044/'+os.environ['API_TEST_TOKEN']+'/server',timeout=3) as r:
 with opener.open('https://127.0.0.1:'+os.environ['API_PORT']+'/'+os.environ['API_TEST_TOKEN']+'/server',timeout=3) as r:
     assert r.status == 200
 PY
@@ -780,7 +776,6 @@ ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname=False
 ctx.load_verify_locations(str(root/'api-cert.pem'))
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
-base='https://127.0.0.1:6044/'+os.environ['API_TEST_TOKEN']
 base='https://127.0.0.1:'+os.environ['API_PORT']+'/'+os.environ['API_TEST_TOKEN']
 def request(method,path,body=None):
     req=urllib.request.Request(base+path,method=method,
@@ -889,7 +884,6 @@ main() {
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y python3-yaml kmod procps
         enable_bbr
-        ufw allow 6044/tcp
         install_api
         show_result
         return
@@ -955,7 +949,6 @@ main() {
     ufw default deny incoming
     ufw default allow outgoing
     local port
-    for port in "$SSH_PORT" 80 443 6044; do
     for port in "$SSH_PORT" 80 443; do
         ufw allow "${port}/tcp"
     done
