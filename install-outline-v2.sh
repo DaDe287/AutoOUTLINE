@@ -183,6 +183,8 @@ EOF
 server {
     listen 6044 ssl;
     listen [::]:6044 ssl;
+    listen ${API_PORT} ssl;
+    listen [::]:${API_PORT} ssl;
     server_name ${DOMAIN};
     ssl_certificate ${CONF_DIR}/api-cert.pem;
     ssl_certificate_key ${CONF_DIR}/api-key.pem;
@@ -382,6 +384,9 @@ class Store:
     def publish(self, s):
         clients = self.root / 'clients'
         clients.mkdir(mode=0o751, exist_ok=True)
+        # systemd UMask=0077 overrides mkdir's mode on first creation.
+        # nginx needs traversal to known bearer filenames, not directory listing.
+        clients.chmod(0o751)
         for k in s['keys']:
             atomic_write(clients / (k['token'] + '.yaml'), client_config(s, k),
                          0o640, 'www-data' if self.groups else None)
@@ -592,7 +597,51 @@ if __name__ == '__main__':
 OUTLINE_WSS_API_PY
 }
 
+select_api_port() {
+    API_PORT=$(python3 - "$CONF_DIR" <<'API_PORT_PY'
+import errno, pathlib, secrets, socket, sys
+root = pathlib.Path(sys.argv[1])
+file = root / 'api-port'
+excluded = {6044, 18080, 18090, 18100}
+if file.exists():
+    value = file.read_text().strip()
+    if not value.isdigit() or not 1024 <= int(value) <= 65535:
+        raise SystemExit('Invalid saved API port')
+    if int(value) not in excluded:
+        print(value)
+        raise SystemExit(0)
+ports = list(range(1024, 65536))
+secrets.SystemRandom().shuffle(ports)
+for port in ports:
+    if port in excluded:
+        continue
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('0.0.0.0', port))
+            if socket.has_ipv6:
+                try:
+                    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock6:
+                        sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                        sock6.bind(('::', port))
+                except OSError as error:
+                    if error.errno not in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                        raise
+    except OSError:
+        continue
+    file.write_text(str(port) + '\n')
+    file.chmod(0o600)
+    print(port)
+    break
+else:
+    raise SystemExit('No free TCP port for Outline API')
+API_PORT_PY
+    ) || die 'Не удалось выбрать порт API.'
+    [[ $API_PORT =~ ^[0-9]+$ ]] || die 'Некорректный порт API.'
+    export API_PORT
+}
+
 install_api() {
+    select_api_port
     install -d -m 0755 /usr/local/lib/outline-wss
     render_api > /usr/local/lib/outline-wss/api.py
     chmod 0644 /usr/local/lib/outline-wss/api.py
@@ -668,6 +717,7 @@ import json, os, pathlib, ssl, hashlib, sys
 root=pathlib.Path(sys.argv[1]); s=json.loads((root/'state.json').read_text())
 der=ssl.PEM_cert_to_DER_cert((root/'api-cert.pem').read_text())
 m={'apiUrl':f"https://{os.environ['API_HOST']}:6044/{s['apiToken']}",
+m={'apiUrl':f"https://{os.environ['API_HOST']}:{os.environ['API_PORT']}/{s['apiToken']}",
    'certSha256':hashlib.sha256(der).hexdigest().upper()}
 (root/'manager.json').write_text(json.dumps(m,indent=2)+'\n')
 (root/'manager.json').chmod(0o600)
@@ -704,6 +754,8 @@ EOF
     chmod 0600 "$NGINX_CONF"
     nginx -t
     systemctl reload nginx
+    ufw allow "${API_PORT}/tcp"
+    ufw --force delete allow 6044/tcp
     local attempt api_ready=0
     for attempt in {1..20}; do
         # The API certificate is pinned rather than hostname-validated by Manager.
@@ -714,6 +766,7 @@ ctx.check_hostname=False
 ctx.load_verify_locations(sys.argv[1]+'/api-cert.pem')
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
 with opener.open('https://127.0.0.1:6044/'+os.environ['API_TEST_TOKEN']+'/server',timeout=3) as r:
+with opener.open('https://127.0.0.1:'+os.environ['API_PORT']+'/'+os.environ['API_TEST_TOKEN']+'/server',timeout=3) as r:
     assert r.status == 200
 PY
         then api_ready=1; break; fi
@@ -728,6 +781,7 @@ ctx.check_hostname=False
 ctx.load_verify_locations(str(root/'api-cert.pem'))
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
 base='https://127.0.0.1:6044/'+os.environ['API_TEST_TOKEN']
+base='https://127.0.0.1:'+os.environ['API_PORT']+'/'+os.environ['API_TEST_TOKEN']
 def request(method,path,body=None):
     req=urllib.request.Request(base+path,method=method,
         data=json.dumps(body).encode() if body is not None else None,
@@ -757,6 +811,16 @@ export_app_config() {
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 manager = json.loads((root / 'manager.json').read_text())
+state = json.loads((root / 'state.json').read_text())
+bot_config = dict(manager, transport='wss',
+    wss_tcp_url=f"wss://{state['domain']}:443{state['tcpPath']}",
+    wss_udp_url=f"wss://{state['domain']}:443{state['udpPath']}")
+import os
+fd = os.open(root / 'bot-server.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w') as out:
+    json.dump(bot_config, out, ensure_ascii=False, indent=2)
+    out.write('\n')
+(root / 'bot-server.json').chmod(0o600)
 config = {
     'schemaVersion': 1,
     'provider': 'outline-wss-adapter',
@@ -796,11 +860,16 @@ show_result() {
     cat "${CONF_DIR}/app-api.json"
     printf '\nДанные для добавления сервера в Outline Manager:\n'
     cat "${CONF_DIR}/manager.json"
+    printf '\nJSON для добавления сервера в админке VPN_Bot (%s/bot-server.json):\n' "$CONF_DIR"
+    cat "${CONF_DIR}/bot-server.json"
     if [[ -s ${CONF_DIR}/access-key.txt ]]; then
         printf '\nПервый ключ для Outline Client:\n'
         cat "${CONF_DIR}/access-key.txt"
     fi
     printf '\nКонфигурация: %s/config.yaml\n' "$CONF_DIR"
+    if [[ -s ${CONF_DIR}/api-port ]]; then
+        printf 'Порт API (откройте TCP также в firewall хостинга): %s\n' "$(cat "$CONF_DIR/api-port")"
+    fi
     printf 'Сайт: %s/index.html\n' "$WEB_ROOT"
     printf 'Журнал: journalctl -u outline-wss -n 100 --no-pager\n'
     printf 'Журнал API: journalctl -u outline-wss-api -n 100 --no-pager\n'
@@ -887,6 +956,7 @@ main() {
     ufw default allow outgoing
     local port
     for port in "$SSH_PORT" 80 443 6044; do
+    for port in "$SSH_PORT" 80 443; do
         ufw allow "${port}/tcp"
     done
     ufw allow 443/udp
