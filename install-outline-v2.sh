@@ -10,6 +10,42 @@ NGINX_CONF=/etc/nginx/sites-available/outline-wss
 
 die() { printf '\nОшибка: %s\n' "$*" >&2; exit 1; }
 
+enable_bbr() {
+    # Optional root prefix is used by isolated tests; production uses /etc.
+    local root=${1:-} available old_qdisc old_cc module_loaded=false
+    if command -v modprobe >/dev/null && modprobe tcp_bbr 2>/dev/null; then
+        module_loaded=true
+    fi
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) || available=''
+    if [[ " $available " != *' bbr '* ]]; then
+        printf '\nBBR не включён: ядро/VPS не предоставляет tcp_bbr.\n' >&2
+        return 0
+    fi
+    old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || old_qdisc=''
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || old_cc=''
+    if [[ -z $old_qdisc || -z $old_cc ]]; then
+        printf '\nBBR не включён: недоступны параметры ядра для проверки.\n' >&2
+        return 0
+    fi
+    if ! sysctl -q -w net.core.default_qdisc=fq ||
+        ! sysctl -q -w net.ipv4.tcp_congestion_control=bbr; then
+        sysctl -q -w "net.core.default_qdisc=$old_qdisc" || true
+        sysctl -q -w "net.ipv4.tcp_congestion_control=$old_cc" || true
+        printf '\nBBR не включён: VPS не разрешает изменение параметров ядра.\n' >&2
+        return 0
+    fi
+    install -d -m 0755 "${root}/etc/sysctl.d" "${root}/etc/modules-load.d"
+    # One dedicated file, overwritten on reruns instead of appending duplicates.
+    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' \
+        > "${root}/etc/sysctl.d/99-outline-wss-bbr.conf"
+    chmod 0644 "${root}/etc/sysctl.d/99-outline-wss-bbr.conf"
+    if [[ $module_loaded == true ]]; then
+        printf 'tcp_bbr\n' > "${root}/etc/modules-load.d/outline-wss-bbr.conf"
+        chmod 0644 "${root}/etc/modules-load.d/outline-wss-bbr.conf"
+    fi
+    printf '\nBBR включён: tcp_congestion_control=bbr, default_qdisc=fq.\n'
+}
+
 valid_domain() {
     local label
     local -a labels
@@ -318,6 +354,14 @@ def client_config(s, k):
             '    cipher: ' + CIPHER, '    secret: ' + json.dumps(k['password'])])
     return '\n'.join(lines) + '\n'
 
+def client_config_json(s, k):
+    transport = {'$type': 'tcpudp'}
+    for kind, path in [('tcp', s['tcpPath']), ('udp', s['udpPath'])]:
+        transport[kind] = {'$type': 'shadowsocks',
+            'endpoint': {'$type': 'websocket', 'url': f"wss://{s['domain']}:443{path}"},
+            'cipher': CIPHER, 'secret': k['password']}
+    return {'transport': transport}
+
 def key_model(s, k):
     return {'id': k['id'], 'name': k['name'], 'password': k['password'], 'method': CIPHER,
         'port': 443, 'accessUrl': f"ssconf://{s['domain']}/config/{k['token']}.yaml"}
@@ -399,7 +443,10 @@ class Store:
             if method == 'GET' and path == '/server':
                 return 200, {'name': s['name'], 'serverId': s['serverId'], 'version': '1.9.2',
                     'createdTimestampMs': s['createdTimestampMs'], 'metricsEnabled': False,
-                    'portForNewAccessKeys': 443, 'hostnameForAccessKeys': s['domain']}
+                    'portForNewAccessKeys': 443, 'hostnameForAccessKeys': s['domain'],
+                    'transport': 'wss',
+                    'wssTcpUrl': f"wss://{s['domain']}:443{s['tcpPath']}",
+                    'wssUdpUrl': f"wss://{s['domain']}:443{s['udpPath']}"}
             if method == 'GET' and path == '/metrics/transfer':
                 return 200, self.usage()
             if method == 'GET' and path == '/access-keys':
@@ -428,7 +475,7 @@ class Store:
                 new['name'] = name
                 self.commit(new)
                 return 204, None
-            m = re.fullmatch(r'/access-keys/([A-Za-z0-9_-]{1,64})(/name)?', path)
+            m = re.fullmatch(r'/access-keys/([A-Za-z0-9_-]{1,64})(/name|/config)?', path)
             kid = m[1] if m else None
             key = next((k for k in s['keys'] if k['id'] == kid), None)
             if (method == 'POST' and path == '/access-keys') or (method == 'PUT' and m and not m[2]):
@@ -457,6 +504,8 @@ class Store:
             if m:
                 if key is None:
                     raise APIError(404, 'Key not found')
+                if method == 'GET' and m[2] == '/config':
+                    return 200, client_config_json(s, key)
                 if method == 'GET' and not m[2]:
                     return 200, key_model(s, key)
                 if method == 'PUT' and m[2]:
@@ -703,7 +752,48 @@ print('API: создание, переименование, удаление WSS
 PY
 }
 
+export_app_config() {
+    python3 - "$CONF_DIR" <<'APP_CONFIG_PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+manager = json.loads((root / 'manager.json').read_text())
+config = {
+    'schemaVersion': 1,
+    'provider': 'outline-wss-adapter',
+    'apiUrl': manager['apiUrl'],
+    'tls': {'mode': 'certificate-sha256', 'certSha256': manager['certSha256']},
+    'transports': ['wss'],
+    'capabilities': {'createKeys': True, 'deleteKeys': True, 'renameKeys': True,
+                     'clientConfigJson': True, 'legacyShadowsocks': False,
+                     'trafficLimits': False},
+    'operations': {
+        'createKey': {'method': 'POST', 'path': '/access-keys',
+                      'bodyExample': {'name': 'user-123'}},
+        'listKeys': {'method': 'GET', 'path': '/access-keys'},
+        'getKey': {'method': 'GET', 'path': '/access-keys/{id}'},
+        'getClientConfig': {'method': 'GET', 'path': '/access-keys/{id}/config'},
+        'renameKey': {'method': 'PUT', 'path': '/access-keys/{id}/name',
+                      'bodyExample': {'name': 'user-123'}},
+        'deleteKey': {'method': 'DELETE', 'path': '/access-keys/{id}'},
+    },
+    'keyResponseFields': ['id', 'name', 'password', 'method', 'port', 'accessUrl'],
+    'minimumOutlineClientVersion': '1.15.0',
+}
+target = root / 'app-api.json'
+# This file contains the management secret, so never expose it through nginx.
+import os
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w') as out:
+    json.dump(config, out, ensure_ascii=False, indent=2)
+    out.write('\n')
+target.chmod(0o600)
+APP_CONFIG_PY
+}
+
 show_result() {
+    export_app_config
+    printf '\nКонфигурация API для backend вашего приложения (%s/app-api.json):\n' "$CONF_DIR"
+    cat "${CONF_DIR}/app-api.json"
     printf '\nДанные для добавления сервера в Outline Manager:\n'
     cat "${CONF_DIR}/manager.json"
     if [[ -s ${CONF_DIR}/access-key.txt ]]; then
@@ -728,7 +818,8 @@ main() {
         [[ -s ${CONF_DIR}/config.yaml ]] &&
             [[ -s ${CONF_DIR}/client.yaml || -s ${CONF_DIR}/state.json ]] || die 'Не найдена предыдущая WSS-установка.'
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-yaml
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-yaml kmod procps
+        enable_bbr
         ufw allow 6044/tcp
         install_api
         show_result
@@ -737,6 +828,7 @@ main() {
     [[ $# -eq 0 ]] || die 'Поддерживается только необязательный параметр --add-api.'
     if [[ -s ${CONF_DIR}/manager.json ]]; then
         printf 'Установка уже выполнялась; существующие ключи не изменены.\n'
+        enable_bbr
         show_result
         return
     fi
@@ -777,7 +869,8 @@ main() {
 
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y nginx certbot ca-certificates curl openssl python3 python3-yaml ufw iproute2
+    apt-get install -y nginx certbot ca-certificates curl openssl python3 python3-yaml ufw iproute2 kmod procps
+    enable_bbr
     [[ -z $(ss -H -ltn 'sport = :18080') ]] || die 'Локальный порт 18080 занят.'
 
     TMP_DIR=$(mktemp -d)
