@@ -392,8 +392,6 @@ class Store:
         if not entries or not entries[-1].get('__CURSOR'):
             raise RuntimeError('Cannot verify config reload: Outline journal cursor unavailable')
         cursor = entries[-1]['__CURSOR']
-        # Send only to the main process; never stop or restart the service.
-        command(['systemctl', 'kill', '--kill-whom=main', '--signal=HUP', 'outline-wss'])
         # ExecReload sends HUP to the main process without restarting the service.
         command(['systemctl', 'reload', 'outline-wss'])
         deadline = time.monotonic() + 8
@@ -691,7 +689,6 @@ def main_directive(name,value):
     if len(matches)>1: raise SystemExit('Ambiguous nginx '+name)
     text=re.sub(pattern,name+' '+value+';',text) if matches else name+' '+value+';\n'+text
 main_directive('worker_processes','auto')
-main_directive('worker_rlimit_nofile','131072')
 main_directive('worker_rlimit_nofile','65535')
 events=list(re.finditer(r'(?m)^[ \t]*events\s*\{([^{}]*)\}',text))
 if len(events)!=1: raise SystemExit('Expected one plain nginx events block')
@@ -712,7 +709,6 @@ if ! nginx -t; then
 fi
 for unit in nginx outline-wss; do
     install -d -m 0755 "/etc/systemd/system/${unit}.service.d"
-    printf '[Service]\nLimitNOFILE=131072\n' > "/etc/systemd/system/${unit}.service.d/outline-capacity.conf"
     printf '[Service]\nLimitNOFILE=65535\n' > "/etc/systemd/system/${unit}.service.d/outline-capacity.conf"
 done
 printf '[Service]\nExecReload=\nExecReload=/bin/kill -HUP $MAINPID\n' > /etc/systemd/system/outline-wss.service.d/reload.conf
@@ -721,12 +717,10 @@ systemctl daemon-reload
 for unit in nginx outline-wss; do
     pid=$(systemctl show "$unit" --property=MainPID --value)
     if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
-        prlimit --pid "$pid" --nofile=131072:131072
         prlimit --pid "$pid" --nofile=65535:65535
     fi
 done
 if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
-echo 'nginx: auto workers, 16384 connections/worker; nginx/Outline NOFILE=131072.'
 echo 'nginx: auto workers, 16384 connections/worker; nginx/Outline NOFILE=65535.'
 echo "Backup: $backup"
 OUTLINE_CAPACITY_SH
@@ -747,7 +741,7 @@ if not (root / 'state.json').exists():
     backend = yaml.safe_load((root / 'config.yaml').read_text())
     client = yaml.safe_load((root / 'client.yaml').read_text())
     endpoint = client['transport']['tcp']['endpoint']
-domain = urlsplit(endpoint.get('url') or endpoint['options'][0]['url']).hostname
+    domain = urlsplit(endpoint.get('url') or endpoint['options'][0]['url']).hostname
     if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
         raise SystemExit('Invalid domain in existing client configuration')
     listeners = backend['services'][0]['listeners']
@@ -1131,7 +1125,6 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 UMask=0077
-LimitNOFILE=131072
 LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
