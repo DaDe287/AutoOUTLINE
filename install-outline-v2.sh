@@ -70,9 +70,6 @@ services:
       - type: websocket-stream
         web_server: web
         path: "${TCP_PATH}"
-      - type: websocket-packet
-        web_server: web
-        path: "${UDP_PATH}"
     keys:
       - id: user-1
         cipher: chacha20-ietf-poly1305
@@ -87,15 +84,17 @@ transport:
   tcp:
     \$type: shadowsocks
     endpoint:
-      \$type: websocket
-      url: "wss://${DOMAIN}:443${TCP_PATH}"
+      \$type: first-supported
+      options:
+        - \$type: websocket
+          url: "wss://${DOMAIN}:8443${TCP_PATH}"
+        - \$type: websocket
+          url: "wss://${DOMAIN}:443${TCP_PATH}"
     cipher: chacha20-ietf-poly1305
     secret: "${SS_SECRET}"
   udp:
     \$type: shadowsocks
-    endpoint:
-      \$type: websocket
-      url: "wss://${DOMAIN}:443${UDP_PATH}"
+    endpoint: "127.0.0.1:9"
     cipher: chacha20-ietf-poly1305
     secret: "${SS_SECRET}"
 EOF
@@ -129,6 +128,8 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
+    listen 8443 ssl http2;
+    listen [::]:8443 ssl http2;
     server_name ${DOMAIN};
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
@@ -151,7 +152,7 @@ server {
     }
 EOF
     local path
-    for path in "$TCP_PATH" "$UDP_PATH"; do
+    for path in "$TCP_PATH"; do
         cat <<EOF
     location = ${path} {
         # Ordinary visits to this path get a 404; only WebSocket upgrades pass.
@@ -317,6 +318,9 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.request import build_opener, ProxyHandler
 
 CIPHER = 'chacha20-ietf-poly1305'
+WSS_PORT = 8443
+WSS_FALLBACK_PORT = 443
+MAX_KEYS = 10000
 
 class APIError(Exception):
     def __init__(self, status, message):
@@ -341,44 +345,68 @@ def atomic_write(path, text, mode=0o600, group=None):
 def backend_config(s):
     return json.dumps({'web': {'servers': [{'id': 'web', 'listen': ['127.0.0.1:18080']}]},
         'services': [{'listeners': [
-            {'type': 'websocket-stream', 'web_server': 'web', 'path': s['tcpPath']},
-            {'type': 'websocket-packet', 'web_server': 'web', 'path': s['udpPath']}],
+            {'type': 'websocket-stream', 'web_server': 'web', 'path': s['tcpPath']}],
             'keys': [{'id': k['id'], 'cipher': CIPHER, 'secret': k['password']} for k in s['keys']]}]}, indent=2) + '\n'
 
 def client_config(s, k):
-    lines = ['transport:', '  $type: tcpudp']
-    for kind, path in [('tcp', s['tcpPath']), ('udp', s['udpPath'])]:
-        lines.extend([f'  {kind}:', '    $type: shadowsocks', '    endpoint:',
-            '      $type: websocket',
-            '      url: ' + json.dumps(f"wss://{s['domain']}:443{path}"),
-            '    cipher: ' + CIPHER, '    secret: ' + json.dumps(k['password'])])
-    return '\n'.join(lines) + '\n'
+    # JSON is valid YAML, so existing .yaml bearer links keep working.
+    return json.dumps(client_config_json(s, k), indent=2) + '\n'
 
 def client_config_json(s, k):
-    transport = {'$type': 'tcpudp'}
-    for kind, path in [('tcp', s['tcpPath']), ('udp', s['udpPath'])]:
-        transport[kind] = {'$type': 'shadowsocks',
-            'endpoint': {'$type': 'websocket', 'url': f"wss://{s['domain']}:443{path}"},
-            'cipher': CIPHER, 'secret': k['password']}
-    return {'transport': transport}
+    return {'transport': {'$type': 'tcpudp',
+        'tcp': {'$type': 'shadowsocks',
+            'endpoint': {'$type': 'first-supported', 'options': [
+                {'$type': 'websocket', 'url': f"wss://{s['domain']}:{port}{s['tcpPath']}"}
+                for port in (WSS_PORT, WSS_FALLBACK_PORT)]},
+            'cipher': CIPHER, 'secret': k['password']},
+        # Do not omit UDP: null would send UDP directly. No remote UDP endpoint.
+        'udp': {'$type': 'shadowsocks', 'endpoint': '127.0.0.1:9',
+                'cipher': CIPHER, 'secret': k['password']}}}
 
 def key_model(s, k):
     return {'id': k['id'], 'name': k['name'], 'password': k['password'], 'method': CIPHER,
-        'port': 443, 'accessUrl': f"ssconf://{s['domain']}/config/{k['token']}.yaml"}
+        'port': WSS_PORT, 'accessUrl': f"ssconf://{s['domain']}/config/{k['token']}.yaml"}
 
 class Store:
     def __init__(self, root, runner=None, groups=True):
         self.root = Path(root)
         self.lock = threading.RLock()
-        self.runner = runner or self.restart
+        self.runner = runner or self.reload
         self.groups = groups
         self.state = json.loads((self.root / 'state.json').read_text())
     @staticmethod
-    def restart():
-        subprocess.run(['systemctl', 'restart', 'outline-wss'], check=True, timeout=20,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-        subprocess.run(['systemctl', 'is-active', '--quiet', 'outline-wss'], check=True, timeout=5)
+    def reload():
+        def command(args):
+            return subprocess.run(args, check=True, timeout=5, capture_output=True, text=True).stdout
+        def main_pid():
+            value = command(['systemctl', 'show', 'outline-wss', '--property=MainPID', '--value']).strip()
+            if not value.isdigit() or int(value) <= 0:
+                raise RuntimeError('Outline backend is not running')
+            return value
+        pid = main_pid()
+        recent = command(['journalctl', '-u', 'outline-wss', '-n', '1', '-o', 'json', '--no-pager'])
+        entries = [json.loads(line) for line in recent.splitlines() if line.startswith('{')]
+        if not entries or not entries[-1].get('__CURSOR'):
+            raise RuntimeError('Cannot verify config reload: Outline journal cursor unavailable')
+        cursor = entries[-1]['__CURSOR']
+        # Send only to the main process; never stop or restart the service.
+        command(['systemctl', 'kill', '--kill-whom=main', '--signal=HUP', 'outline-wss'])
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if main_pid() != pid:
+                raise RuntimeError('Outline process changed during config reload')
+            log = command(['journalctl', '-u', 'outline-wss', '--after-cursor=' + cursor,
+                           '-o', 'json', '--no-pager'])
+            for line in log.splitlines():
+                if not line.startswith('{'):
+                    continue
+                message = json.loads(line).get('MESSAGE', '')
+                if 'Failed to update server.' in message:
+                    raise RuntimeError('Outline rejected updated configuration')
+                if 'Loaded config.' in message:
+                    return
+            time.sleep(0.1)
+        raise RuntimeError('Outline did not confirm config reload')
     def publish(self, s):
         clients = self.root / 'clients'
         clients.mkdir(mode=0o751, exist_ok=True)
@@ -386,8 +414,10 @@ class Store:
         # nginx needs traversal to known bearer filenames, not directory listing.
         clients.chmod(0o751)
         for k in s['keys']:
-            atomic_write(clients / (k['token'] + '.yaml'), client_config(s, k),
-                         0o640, 'www-data' if self.groups else None)
+            target = clients / (k['token'] + '.yaml')
+            text = client_config(s, k)
+            if not target.exists() or target.read_text() != text:
+                atomic_write(target, text, 0o640, 'www-data' if self.groups else None)
         atomic_write(self.root / 'config.yaml', backend_config(s),
                      0o640, 'outline-wss' if self.groups else None)
     def prune(self):
@@ -446,10 +476,11 @@ class Store:
             if method == 'GET' and path == '/server':
                 return 200, {'name': s['name'], 'serverId': s['serverId'], 'version': '1.9.2',
                     'createdTimestampMs': s['createdTimestampMs'], 'metricsEnabled': False,
-                    'portForNewAccessKeys': 443, 'hostnameForAccessKeys': s['domain'],
+                    'portForNewAccessKeys': WSS_PORT, 'hostnameForAccessKeys': s['domain'],
                     'transport': 'wss',
-                    'wssTcpUrl': f"wss://{s['domain']}:443{s['tcpPath']}",
-                    'wssUdpUrl': f"wss://{s['domain']}:443{s['udpPath']}"}
+                    'wssTcpUrl': f"wss://{s['domain']}:{WSS_PORT}{s['tcpPath']}",
+                    'wssTcpFallbackUrl': f"wss://{s['domain']}:{WSS_FALLBACK_PORT}{s['tcpPath']}",
+                    'wssUdpUrl': None, 'udpEnabled': False}
             if method == 'GET' and path == '/metrics/transfer':
                 return 200, self.usage()
             if method == 'GET' and path == '/access-keys':
@@ -463,8 +494,8 @@ class Store:
                     raise APIError(501, 'Telemetry submission is not supported')
                 return 204, None
             if method == 'PUT' and path == '/server/port-for-new-access-keys':
-                if body.get('port') != 443:
-                    raise APIError(400, 'WSS port is fixed to 443')
+                if body.get('port') != WSS_PORT:
+                    raise APIError(400, 'WSS primary port is fixed to 8443')
                 return 204, None
             if method == 'PUT' and path == '/server/hostname-for-access-keys':
                 if body.get('hostname') != s['domain']:
@@ -482,10 +513,10 @@ class Store:
             kid = m[1] if m else None
             key = next((k for k in s['keys'] if k['id'] == kid), None)
             if (method == 'POST' and path == '/access-keys') or (method == 'PUT' and m and not m[2]):
-                if len(s['keys']) >= 1000 or key:
+                if len(s['keys']) >= MAX_KEYS or key:
                     raise APIError(409, 'Key already exists or maximum number of keys reached')
-                if body.get('port', 443) != 443 or body.get('method', CIPHER) != CIPHER:
-                    raise APIError(400, 'Only port 443 and chacha20-ietf-poly1305 are supported')
+                if body.get('port', WSS_PORT) != WSS_PORT or body.get('method', CIPHER) != CIPHER:
+                    raise APIError(400, 'Only port 8443 and chacha20-ietf-poly1305 are supported')
                 if 'limit' in body:
                     raise APIError(501, 'Data limits are not supported')
                 name, password = body.get('name', ''), body.get('password', secrets.token_urlsafe(32))
@@ -600,7 +631,7 @@ select_api_port() {
 import errno, pathlib, secrets, socket, sys
 root = pathlib.Path(sys.argv[1])
 file = root / 'api-port'
-excluded = {6044, 18080, 18090, 18100}
+excluded = {6044, 8443, 18080, 18090, 18100}
 if file.exists():
     value = file.read_text().strip()
     if not value.isdigit() or not 1024 <= int(value) <= 65535:
@@ -638,7 +669,58 @@ API_PORT_PY
     export API_PORT
 }
 
+configure_nginx_capacity() {
+    bash <<'OUTLINE_CAPACITY_SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $EUID -eq 0 ]] || { echo 'Run as root'; exit 1; }
+backup=$(mktemp /etc/nginx/nginx.conf.outline-backup.XXXXXX)
+cp -p /etc/nginx/nginx.conf "$backup"
+python3 - /etc/nginx/nginx.conf <<'NGINX_TUNE_PY'
+import pathlib, re, sys
+path=pathlib.Path(sys.argv[1]); text=path.read_text()
+def main_directive(name,value):
+    global text
+    pattern=rf'(?m)^[ \t]*{name}\s+[^;]+;'
+    matches=list(re.finditer(pattern,text))
+    if len(matches)>1: raise SystemExit('Ambiguous nginx '+name)
+    text=re.sub(pattern,name+' '+value+';',text) if matches else name+' '+value+';\n'+text
+main_directive('worker_processes','auto')
+main_directive('worker_rlimit_nofile','131072')
+events=list(re.finditer(r'(?m)^[ \t]*events\s*\{([^{}]*)\}',text))
+if len(events)!=1: raise SystemExit('Expected one plain nginx events block')
+event=events[0]; body=event.group(1)
+pattern=r'(?m)^[ \t]*worker_connections\s+[^;]+;'
+if len(re.findall(pattern,body))>1: raise SystemExit('Ambiguous worker_connections')
+body=re.sub(pattern,'    worker_connections 16384;',body) if re.search(pattern,body) else '\n    worker_connections 16384;\n'+body
+text=text[:event.start(1)]+body+text[event.end(1):]
+path.write_text(text)
+NGINX_TUNE_PY
+if ! nginx -t; then
+    cp -p "$backup" /etc/nginx/nginx.conf
+    echo "nginx config rejected; restored backup: $backup" >&2
+    exit 1
+fi
+for unit in nginx outline-wss; do
+    install -d -m 0755 "/etc/systemd/system/${unit}.service.d"
+    printf '[Service]\nLimitNOFILE=131072\n' > "/etc/systemd/system/${unit}.service.d/outline-capacity.conf"
+done
+systemctl daemon-reload
+# Apply limits to running masters without restarting either service.
+for unit in nginx outline-wss; do
+    pid=$(systemctl show "$unit" --property=MainPID --value)
+    if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+        prlimit --pid "$pid" --nofile=131072:131072
+    fi
+done
+if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
+echo 'nginx: auto workers, 16384 connections/worker; nginx/Outline NOFILE=131072.'
+echo "Backup: $backup"
+OUTLINE_CAPACITY_SH
+}
+
 install_api() {
+    configure_nginx_capacity
     select_api_port
     install -d -m 0755 /usr/local/lib/outline-wss
     render_api > /usr/local/lib/outline-wss/api.py
@@ -651,7 +733,8 @@ root = pathlib.Path(__import__('sys').argv[1])
 if not (root / 'state.json').exists():
     backend = yaml.safe_load((root / 'config.yaml').read_text())
     client = yaml.safe_load((root / 'client.yaml').read_text())
-    domain = urlsplit(client['transport']['tcp']['endpoint']['url']).hostname
+    endpoint = client['transport']['tcp']['endpoint']
+domain = urlsplit(endpoint.get('url') or endpoint['options'][0]['url']).hostname
     if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
         raise SystemExit('Invalid domain in existing client configuration')
     listeners = backend['services'][0]['listeners']
@@ -667,7 +750,8 @@ if not (root / 'state.json').exists():
     state = {'domain': domain, 'name': 'Outline WSS', 'serverId': str(uuid.uuid4()),
         'createdTimestampMs': int(time.time()*1000), 'apiToken': secrets.token_hex(32),
         'tcpPath': next(x['path'] for x in listeners if x['type']=='websocket-stream'),
-        'udpPath': next(x['path'] for x in listeners if x['type']=='websocket-packet'),
+        'udpPath': next((x['path'] for x in listeners if x['type']=='websocket-packet'),
+                        '/v2/api/'+secrets.token_hex(24)+'/packet'),
         'nextId': 1, 'keys': [{'id': str(old_keys[0]['id']), 'name': 'First key',
                               'password': old_keys[0]['secret'], 'token': token}]}
     (root / 'state.json').write_text(json.dumps(state, indent=2)+'\n')
@@ -786,7 +870,7 @@ def request(method,path,body=None):
         return json.loads(raw) if raw else None
 key=request('POST','/access-keys',{'name':'Installation check'})
 try:
-    assert key['port']==443 and key['accessUrl'].startswith('ssconf://')
+    assert key['port']==8443 and key['accessUrl'].startswith('ssconf://')
     token=key['accessUrl'].rsplit('/',1)[-1]
     assert (root/'clients'/token).is_file()
     assert key['password'] in (root/'config.yaml').read_text()
@@ -808,8 +892,9 @@ root = pathlib.Path(sys.argv[1])
 manager = json.loads((root / 'manager.json').read_text())
 state = json.loads((root / 'state.json').read_text())
 bot_config = dict(manager, transport='wss',
-    wss_tcp_url=f"wss://{state['domain']}:443{state['tcpPath']}",
-    wss_udp_url=f"wss://{state['domain']}:443{state['udpPath']}")
+    wss_tcp_url=f"wss://{state['domain']}:8443{state['tcpPath']}",
+    wss_tcp_fallback_url=f"wss://{state['domain']}:443{state['tcpPath']}",
+    wss_udp_url=None, udp_enabled=False)
 import os
 fd = os.open(root / 'bot-server.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, 'w') as out:
@@ -949,10 +1034,9 @@ main() {
     ufw default deny incoming
     ufw default allow outgoing
     local port
-    for port in "$SSH_PORT" 80 443; do
+    for port in "$SSH_PORT" 80 443 8443; do
         ufw allow "${port}/tcp"
     done
-    ufw allow 443/udp
     ufw --force enable
 
     local asset="outline-ss-server_${OUTLINE_VERSION}_linux_${ARCH}.tar.gz"
@@ -1034,7 +1118,7 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 UMask=0077
-LimitNOFILE=65536
+LimitNOFILE=131072
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1069,12 +1153,13 @@ EOF
     python3 - "$DOMAIN" "$TCP_PATH" "$UDP_PATH" <<'PY'
 import base64, hashlib, os, socket, ssl, sys
 domain = sys.argv[1]
-for path in sys.argv[2:]:
+for port in (8443, 443):
+    path = sys.argv[2]
     key = base64.b64encode(os.urandom(16)).decode()
     request = (f'GET {path} HTTP/1.1\r\nHost: {domain}\r\n'
                'Upgrade: websocket\r\nConnection: Upgrade\r\n'
                f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
-    with socket.create_connection(('127.0.0.1', 443), timeout=10) as tcp:
+    with socket.create_connection(('127.0.0.1', port), timeout=10) as tcp:
         with ssl.create_default_context().wrap_socket(tcp, server_hostname=domain) as tls:
             tls.sendall(request.encode())
             data = b''
@@ -1095,7 +1180,7 @@ for path in sys.argv[2:]:
                            if k.lower() == 'sec-websocket-accept'), None)
             if accept != expected:
                 raise SystemExit('WebSocket: неверный Sec-WebSocket-Accept')
-print('HTTPS, загрузка ключа и оба WebSocket-входа проверены.')
+print('HTTPS, загрузка ключа и TCP WebSocket на 8443/443 проверены.')
 PY
     show_result
 }
