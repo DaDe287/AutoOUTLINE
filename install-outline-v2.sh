@@ -84,12 +84,8 @@ transport:
   tcp:
     \$type: shadowsocks
     endpoint:
-      \$type: first-supported
-      options:
-        - \$type: websocket
-          url: "wss://${DOMAIN}:8443${TCP_PATH}"
-        - \$type: websocket
-          url: "wss://${DOMAIN}:443${TCP_PATH}"
+      \$type: websocket
+      url: "wss://${DOMAIN}:8443${TCP_PATH}"
     cipher: chacha20-ietf-poly1305
     secret: "${SS_SECRET}"
   udp:
@@ -322,7 +318,6 @@ from urllib.request import build_opener, ProxyHandler
 
 CIPHER = 'chacha20-ietf-poly1305'
 WSS_PORT = 8443
-WSS_FALLBACK_PORT = 443
 MAX_KEYS = 10000
 
 class APIError(Exception):
@@ -358,9 +353,8 @@ def client_config(s, k):
 def client_config_json(s, k):
     return {'transport': {'$type': 'tcpudp',
         'tcp': {'$type': 'shadowsocks',
-            'endpoint': {'$type': 'first-supported', 'options': [
-                {'$type': 'websocket', 'url': f"wss://{s['domain']}:{port}{s['tcpPath']}"}
-                for port in (WSS_PORT, WSS_FALLBACK_PORT)]},
+            'endpoint': {'$type': 'websocket',
+                         'url': f"wss://{s['domain']}:{WSS_PORT}{s['tcpPath']}"},
             'cipher': CIPHER, 'secret': k['password']},
         # Do not omit UDP: null would send UDP directly. No remote UDP endpoint.
         'udp': {'$type': 'shadowsocks', 'endpoint': '127.0.0.1:9',
@@ -482,7 +476,7 @@ class Store:
                     'portForNewAccessKeys': WSS_PORT, 'hostnameForAccessKeys': s['domain'],
                     'transport': 'wss',
                     'wssTcpUrl': f"wss://{s['domain']}:{WSS_PORT}{s['tcpPath']}",
-                    'wssTcpFallbackUrl': f"wss://{s['domain']}:{WSS_FALLBACK_PORT}{s['tcpPath']}",
+                    'wssTcpFallbackUrl': None,
                     'wssUdpUrl': None, 'udpEnabled': False}
             if method == 'GET' and path == '/metrics/transfer':
                 return 200, self.usage()
@@ -900,7 +894,7 @@ manager = json.loads((root / 'manager.json').read_text())
 state = json.loads((root / 'state.json').read_text())
 bot_config = dict(manager, transport='wss',
     wss_tcp_url=f"wss://{state['domain']}:8443{state['tcpPath']}",
-    wss_tcp_fallback_url=f"wss://{state['domain']}:443{state['tcpPath']}",
+    wss_tcp_fallback_url=None,
     wss_udp_url=None, udp_enabled=False)
 import os
 fd = os.open(root / 'bot-server.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
